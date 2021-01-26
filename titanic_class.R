@@ -13,11 +13,11 @@ library(ggalluvial)
 
 # dados             --------------------------------------------------------
 
-# importadar dados 
+# importacao
 train_titanic <- read.csv("train.csv", na.strings = c("", " ")) %>% clean_names()
 test_titanic  <- read.csv("test.csv" , na.strings = c("", " ")) %>% clean_names()
 
-# padronizar colunas
+# padronizacao de  colunas
 train_titanic <- train_titanic %>% mutate(is_train = TRUE)
 test_titanic  <- test_titanic %>% mutate(is_train = FALSE, survived = NA)
 
@@ -93,12 +93,11 @@ recipe(survived~., data = split_titanic) %>%
   step_mutate_at(c("child","woman"), fn= as.factor) %>% 
   step_mutate(family_size = parch + sib_sp +1) %>% 
   step_mutate(title = str_extract(name,"[A-z]*\\.")) %>% 
-  step_other(title , threshold = 0.044) %>% 
+  step_other(title , threshold = 0.044) %>%
   update_role(passenger_id, name, ticket, cabin, new_role = "id")
 
 # preparacao
 prep_titanic <- prep(rec_titanic, retain = TRUE)
-
 
 # aplicacao
 split_titanic_trans <- bake(prep_titanic, new_data = NULL)
@@ -106,23 +105,44 @@ train_titanic_trans <- split_titanic_trans %>% filter(is_train == TRUE)
 test_titanic_trans  <- split_titanic_trans %>% filter(is_train == FALSE)
 
 
-# modelo            --------------------------------------------------------
+train_titanic_trans_down <- 
+  recipe(survived~., data = train_titanic_trans) %>% 
+  themis::step_downsample(survived) %>% 
+  prep() %>% 
+  juice()
 
+train_titanic_trans_down %>% ggplot(aes(x=survived))+geom_bar(stat = "count")
+
+train_titanic_trans_up <- 
+  recipe(survived~., data = train_titanic_trans) %>% 
+  themis::step_upsample(survived) %>% 
+  prep() %>% 
+  juice()
+
+train_titanic_trans_up %>% ggplot(aes(x=survived))+geom_bar(stat = "count")
+
+
+
+# modelo            --------------------------------------------------------
 # especificacao
 set.seed(123)
 mdl_spec_rf_titanic <- 
   rand_forest() %>% 
   set_mode("classification") %>% 
-  set_engine("randomForest")
+  set_engine("randomForest") 
 
 # treinar 
 mdl_fit_rf_titanic <- 
   mdl_spec_rf_titanic %>% 
-  fit(survived ~ child + woman + title + family_size, 
-      data = train_titanic_trans)
+  fit(survived ~ child + woman + title + family_size,  data = train_titanic_trans_down)
+
+mdl_fit_rf_titanic
+
+
+# validacao         --------------------------------------------------------
 
 # reamostragem 
-resample_titanic <- bootstraps(train_titanic_trans, strata = survived)
+resample_titanic <- bootstraps(train_titanic_trans_down, strata = survived)
 
 # validacao reamostragem 
 mdl_fit_resample_rf_titanic <- 
@@ -132,17 +152,45 @@ mdl_fit_resample_rf_titanic <-
                 metrics = metric_set(roc_auc, accuracy, sens),
                 control = control_resamples(save_pred = TRUE))
 
-
-mdl_fit_resample_rf_titanic
-
-# validacao         --------------------------------------------------------
-
+# analise dos resultados reamostragem
+mdl_fit_resample_rf_titanic %>% collect_metrics()
 mdl_fit_resample_rf_titanic %>% unnest(.predictions) %>% conf_mat(survived, .pred_class)
 
 
 # submissao         --------------------------------------------------------
-submission <- data.frame(PassengerId = test_titanic_trans$passenger_id,
-                         Survived = predict(mdl_fit_rf_titanic, new_data = test_titanic_trans)) %>% 
+submission <- 
+  data.frame(PassengerId = test_titanic_trans$passenger_id,
+             Survived    = predict(mdl_fit_rf_titanic,
+                                   new_data = test_titanic_trans)) %>% 
   rename(Survived = .pred_class)
+  
 
-write.csv(submission, file = "titanic_kaglle_v3.csv", row.names = FALSE)
+write.csv(submission, file = "titanic_kaglle_v5.csv", row.names = FALSE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+data("credit_data")
+
+
+credit_data %>% tabyl(Status)
