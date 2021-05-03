@@ -10,32 +10,49 @@ library(janitor)
 library(ggpubr)
 library(funModeling)
 library(ggalluvial)
+library(vip)
 
 # dados             --------------------------------------------------------
 
-# importacao
-train_titanic <- read.csv("train.csv", na.strings = c("", " ")) %>% clean_names()
-test_titanic  <- read.csv("test.csv" , na.strings = c("", " ")) %>% clean_names()
+full_titanic <- 
+  read.csv("train.csv", na.strings = c(""," ")) %>% 
+  clean_names() %>% 
+  mutate(is_train = TRUE) %>% 
+  mutate(across(c("sex","embarked","survived","pclass"), as.factor))
 
-# padronizacao de  colunas
-train_titanic <- train_titanic %>% mutate(is_train = TRUE)
-test_titanic  <- test_titanic %>% mutate(is_train = FALSE, survived = NA)
 
-# juntar os conjuntos
-split_titanic <-bind_rows(train_titanic, test_titanic)
+new_data_titanic <- 
+  read.csv("test.csv", na.strings = c(""," ")) %>% 
+  clean_names() %>% 
+  mutate(survived = NA, is_train = FALSE) %>% 
+  mutate(across(c("sex","embarked","survived","pclass"), as.factor))
 
-# validacao
-split_titanic %>% df_status()
-split_titanic %>% visdat::vis_dat()
+
+split_titanic <- initial_split(full_titanic, prop = 3/4, strata = survived)
+
+train_titanic <- training(split_titanic)
+test_titanic <- testing(split_titanic)
+
+
+set.seed(123)
+resample_titanic <- bootstraps(train_titanic, strata= survived)
+
 
 # exploracao        --------------------------------------------------------
 
 # correlacao
 train_titanic %>% 
+  mutate(survived = as.numeric(survived)) %>% 
   select_if(is.numeric) %>% 
   GGally::ggscatmat(color = "survived", corMethod = "spearman")+
   theme_pubclean()
-  
+
+
+train_titanic %>% 
+  ggplot(aes(x=fare))+
+  geom_histogram()
+
+
 # age 
 train_titanic %>% 
   ggplot(aes(x=age, fill = factor(survived)))+
@@ -84,113 +101,93 @@ train_titanic %>%
 
 # especificacao
 rec_titanic <- 
-recipe(survived~., data = split_titanic) %>% 
-  step_mutate_at(c("sex","embarked","survived","pclass"), fn = as.factor) %>% 
-  step_modeimpute(embarked) %>% 
-  step_knnimpute(age, fare, neighbors = 3, impute_with = c("sex","pclass","embarked","parch","sib_sp")) %>% 
+  recipe(survived~., data = train_titanic) %>% 
+  step_impute_mode(embarked) %>% 
+  step_impute_knn(age, fare, neighbors = 3, impute_with = c("sex","pclass","embarked","parch","sib_sp")) %>% 
   step_mutate(child = ifelse(age <=14, 1,0)) %>% 
   step_mutate(woman = ifelse(age >14 & sex=="female",1,0)) %>% 
   step_mutate_at(c("child","woman"), fn= as.factor) %>% 
   step_mutate(family_size = parch + sib_sp +1) %>% 
   step_mutate(title = str_extract(name,"[A-z]*\\.")) %>% 
   step_other(title , threshold = 0.044) %>%
-  update_role(passenger_id, name, ticket, cabin, new_role = "id")
-
-# preparacao
-prep_titanic <- prep(rec_titanic, retain = TRUE)
-
-# aplicacao
-split_titanic_trans <- bake(prep_titanic, new_data = NULL)
-train_titanic_trans <- split_titanic_trans %>% filter(is_train == TRUE)
-test_titanic_trans  <- split_titanic_trans %>% filter(is_train == FALSE)
-
-
-train_titanic_trans_down <- 
-  recipe(survived~., data = train_titanic_trans) %>% 
-  themis::step_downsample(survived) %>% 
-  prep() %>% 
-  juice()
-
-train_titanic_trans_down %>% ggplot(aes(x=survived))+geom_bar(stat = "count")
-
-train_titanic_trans_up <- 
-  recipe(survived~., data = train_titanic_trans) %>% 
-  themis::step_upsample(survived) %>% 
-  prep() %>% 
-  juice()
-
-train_titanic_trans_up %>% ggplot(aes(x=survived))+geom_bar(stat = "count")
-
-
+  update_role(passenger_id, name, ticket, cabin, new_role = "id") %>% 
+  themis::step_downsample(survived)
 
 # modelo            --------------------------------------------------------
-# especificacao
-set.seed(123)
-mdl_spec_rf_titanic <- 
-  rand_forest() %>% 
+mdl_spec_xgb_titanic <- 
+  boost_tree() %>% 
   set_mode("classification") %>% 
-  set_engine("randomForest") 
+  set_engine("xgboost") %>% 
+  set_args(trees = 300,
+           tree_depth = tune(),
+           min_n = tune(),
+           loss_reduction = tune(),
+           sample_size = tune(),
+           mtry = tune(),
+           learn_rate = tune())
 
-# treinar 
-mdl_fit_rf_titanic <- 
-  mdl_spec_rf_titanic %>% 
-  fit(survived ~ child + woman + title + family_size,  data = train_titanic_trans_down)
 
-mdl_fit_rf_titanic
+# workflow          ----------------------------------------------------------------
+wkfl_xgb_titanic <- 
+  workflow() %>% 
+  add_recipe(rec_titanic) %>% 
+  add_model(mdl_spec_xgb_titanic, formula = survived ~ child + woman + title + family_size)
+
+# tune              --------------------------------------------------------------------
+grid_xgb_titanic <- 
+  grid_latin_hypercube(
+    tree_depth(),
+    min_n(),
+    loss_reduction(),
+    sample_size = sample_prop(),
+    finalize(mtry(), train_titanic),
+    learn_rate(),
+    size = 10 )
+
+tune_xgb_titanic <- 
+  tune_grid(object = wkfl_xgb_titanic,
+            resamples = resample_titanic,
+            grid = grid_xgb_titanic,
+            control  = control_grid(save_pred = TRUE))
+
+tune_xgb_titanic %>% show_best(metric = "roc_auc")
+
+best_grid_xgb_titanic <- tune_xgb_titanic %>% select_best(metric = "roc_auc")
+
+best_grid_xgb_titanic
 
 
-# validacao         --------------------------------------------------------
+final_wkfl_xgb_titanic <- 
+  finalize_workflow(wkfl_xgb_titanic, best_grid_xgb_titanic)
 
-# reamostragem 
-resample_titanic <- bootstraps(train_titanic_trans_down, strata = survived)
+final_wkfl_xgb_titanic
 
-# validacao reamostragem 
-mdl_fit_resample_rf_titanic <- 
-  mdl_spec_rf_titanic %>% 
-  fit_resamples(survived ~ child + woman + title + family_size,
-                resample_titanic,
-                metrics = metric_set(roc_auc, accuracy, sens),
-                control = control_resamples(save_pred = TRUE))
 
-# analise dos resultados reamostragem
-mdl_fit_resample_rf_titanic %>% collect_metrics()
-mdl_fit_resample_rf_titanic %>% unnest(.predictions) %>% conf_mat(survived, .pred_class)
+# validation        --------------------------------------------------------------
+final_vld_xgb_titanic <- 
+  last_fit(final_wkfl_xgb_titanic, split =  split_titanic) 
+
+final_vld_xgb_titanic %>% collect_metrics()
+
+
+# final_model       -------------------------------------------------------------
+final_wkfl_xgb_titanic %>% 
+  fit(data = full_titanic) %>% 
+  pull_workflow_fit() %>% 
+  vip(geom = "point")
+
+final_mdl_fit_xgb_titanic <- 
+  final_wkfl_xgb_titanic %>% 
+  fit(data  = full_titanic)
 
 
 # submissao         --------------------------------------------------------
 submission <- 
-  data.frame(PassengerId = test_titanic_trans$passenger_id,
-             Survived    = predict(mdl_fit_rf_titanic,
-                                   new_data = test_titanic_trans)) %>% 
+  data.frame(PassengerId = new_data_titanic$passenger_id,
+             Survived    = predict(final_mdl_fit_xgb_titanic,
+                                   new_data = new_data_titanic)) %>% 
   rename(Survived = .pred_class)
-  
-
-write.csv(submission, file = "titanic_kaglle_v5.csv", row.names = FALSE)
 
 
+write.csv(submission, file = "titanic_kaglle_v10.csv", row.names = FALSE)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-data("credit_data")
-
-
-credit_data %>% tabyl(Status)
